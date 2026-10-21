@@ -81,7 +81,7 @@ export const useGameStore = create((set, get) => ({
           tiles: { ...state.tiles, [key]: updatedTile },
           inventory: { ...state.inventory, [seedKey]: state.inventory[seedKey] - 1 },
         }
-      } else if (activeTool === 'wateringCan' && tile.state === 'seeded' || tile.state === 'growing') {
+      } else if (activeTool === 'wateringCan' && (tile.state === 'seeded' || tile.state === 'growing')) {
         updatedTile.watered = true
       } else if (activeTool === 'scythe' && tile.state === 'harvestable') {
         const crop = tile.cropType
@@ -108,7 +108,8 @@ export const useGameStore = create((set, get) => ({
 
       // Every 120 ticks = 1 in-game "hour"; 24 hours = new day
       const TICKS_PER_DAY = 2880
-      if (newTick % TICKS_PER_DAY === 0) newDay += 1
+      const isNewDay = newTick % TICKS_PER_DAY === 0
+      if (isNewDay) newDay += 1
 
       const timeOfDay = (newTick % TICKS_PER_DAY) / TICKS_PER_DAY
 
@@ -119,7 +120,15 @@ export const useGameStore = create((set, get) => ({
 
       for (const key in updatedTiles) {
         const tile = { ...updatedTiles[key] }
-        if ((tile.state === 'seeded' || tile.state === 'growing') && tile.watered) {
+        const isGrowingCrop = tile.state === 'seeded' || tile.state === 'growing'
+
+        // Crops dry out at the start of each day and must be re-watered
+        if (isNewDay && isGrowingCrop && tile.watered) {
+          tile.watered = false
+          updatedTiles[key] = tile
+        }
+
+        if (isGrowingCrop && tile.watered) {
           tile.growthTick += 1
           const threshold = GROWTH_THRESHOLDS[tile.cropType] ?? 60
           if (tile.growthTick >= threshold) {
@@ -127,7 +136,6 @@ export const useGameStore = create((set, get) => ({
           } else if (tile.growthTick > threshold / 2) {
             tile.state = 'growing'
           }
-          tile.watered = false  // must re-water each day
           updatedTiles[key] = tile
         }
       }
