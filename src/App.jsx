@@ -61,7 +61,6 @@ const useGameStore = create((set, get) => ({
         tile.growthTick += 1
         if (tile.growthTick >= 10) tile.state = 'harvestable'
         else if (tile.growthTick >= 5) tile.state = 'growing'
-        tile.watered = false
         updatedTiles[key] = tile
       }
     }
