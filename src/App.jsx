@@ -1,7 +1,8 @@
 // src/App.jsx
-import { Canvas, useFrame } from '@react-three/fiber'
-import { OrthographicCamera, Text, Billboard } from '@react-three/drei'
-import { useRef, useEffect } from 'react'
+import { Canvas, useFrame, useLoader, useThree } from '@react-three/fiber'
+import { OrthographicCamera, Text, Billboard, useFBX, useAnimations } from '@react-three/drei'
+import { useRef, useEffect, useMemo, Suspense } from 'react'
+import * as THREE from 'three'
 import { create } from 'zustand'
 
 
@@ -173,12 +174,83 @@ function Farm() {
   )
 }
 
-// ── Player ──
+// ── Player (FBX character) ──
+// Drop these files into /public/models (Vite serves /public at the site root):
+//   public/models/Barbarian.fbx
+//   public/models/barbarian_texture.png
+//   public/models/animations/Rig_Medium_MovementBasic.fbx
+//   public/models/animations/Idle.fbx
+const MODEL_URL     = '/models/Barbarian.fbx'
+const TEXTURE_URL   = '/models/barbarian_texture.png'
+const WALK_ANIM_URL = '/models/animations/Rig_Medium_MovementBasic.fbx'
+const IDLE_ANIM_URL = '/models/animations/Idle.fbx'
+
+const WALK_SPEED   = 4      // top movement speed (units/sec)
+const TURN_SPEED   = 10     // how fast the character rotates to face its heading
+const ACCELERATION = 10     // how fast it reaches top speed (lerp factor)
+const PLAYER_HEIGHT = 0.9   // model is auto-scaled to this height (tiles are 1 unit)
+const GROUND_Y = 0.08       // stand just on top of the tile surface
+
+const UP = new THREE.Vector3(0, 1, 0)
 const keys = {}
+
 function Player() {
-  const meshRef = useRef()
+  const groupRef = useRef()
   const movePlayer = useGameStore((s) => s.movePlayer)
-  const pos = useRef([5, 0, 5])
+  const camera = useThree((s) => s.camera)
+
+  // Model + external animation clips + texture load in parallel (suspends)
+  const [barbarian, walkFbx, idleFbx] = useFBX([MODEL_URL, WALK_ANIM_URL, IDLE_ANIM_URL])
+  const texture = useLoader(THREE.TextureLoader, TEXTURE_URL)
+
+  const clips = useMemo(
+    () => [...walkFbx.animations, ...idleFbx.animations],
+    [walkFbx, idleFbx],
+  )
+  // useAnimations runs the mixer for us each frame
+  const { actions } = useAnimations(clips, barbarian)
+
+  const walkAction = useRef(null)
+  const idleAction = useRef(null)
+  const velocity = useRef(new THREE.Vector3())
+  const targetVelocity = useRef(new THREE.Vector3())
+  const isWalking = useRef(false)
+
+  // Apply texture, cast shadows, auto-scale to fit the tiles and rest feet on the ground
+  useEffect(() => {
+    if (!barbarian) return
+    texture.colorSpace = THREE.SRGBColorSpace
+    barbarian.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true
+        child.material.map = texture
+        child.material.needsUpdate = true
+      }
+    })
+    // Measure at scale 1 so re-runs (e.g. StrictMode) don't compound the scale
+    barbarian.scale.setScalar(1)
+    barbarian.position.y = 0
+    const size = new THREE.Box3().setFromObject(barbarian).getSize(new THREE.Vector3())
+    barbarian.scale.setScalar(PLAYER_HEIGHT / (size.y || 1))
+    const box = new THREE.Box3().setFromObject(barbarian)
+    barbarian.position.y = -box.min.y
+  }, [barbarian, texture])
+
+  // Bind the walk / idle clips
+  useEffect(() => {
+    const walkClip = THREE.AnimationClip.findByName(clips, 'Walking_A')
+    // Mixamo often names the idle clip internally as 'mixamo.com'
+    const idleClip =
+      THREE.AnimationClip.findByName(clips, 'mixamo.com') ||
+      clips.find((c) => c.name.toLowerCase().includes('idle'))
+    if (!walkClip || !idleClip) {
+      console.warn('Walk/Idle clips not found in FBX animations:', clips.map((c) => c.name))
+      return
+    }
+    walkAction.current = actions[walkClip.name]
+    idleAction.current = actions[idleClip.name]
+    idleAction.current?.play()
+  }, [actions, clips])
 
   useEffect(() => {
     const down = (e) => { keys[e.code] = true }
@@ -189,23 +261,64 @@ function Player() {
   }, [])
 
   useFrame((_, delta) => {
-    let [x, y, z] = pos.current
-    if (keys['KeyW'] || keys['ArrowUp'])    z -= 4 * delta
-    if (keys['KeyS'] || keys['ArrowDown'])  z += 4 * delta
-    if (keys['KeyA'] || keys['ArrowLeft'])  x -= 4 * delta
-    if (keys['KeyD'] || keys['ArrowRight']) x += 4 * delta
-    x = Math.max(0, Math.min(9.45, x))
-    z = Math.max(0, Math.min(9.45, z))
-    pos.current = [x, y, z]
-    if (meshRef.current) meshRef.current.position.set(x, 0.3, z)
-    movePlayer([x, y, z])
+    const group = groupRef.current
+    if (!group) return
+
+    const moving =
+      keys['KeyW'] || keys['ArrowUp'] || keys['KeyS'] || keys['ArrowDown'] ||
+      keys['KeyA'] || keys['ArrowLeft'] || keys['KeyD'] || keys['ArrowRight']
+
+    // A. Crossfade between walk and idle
+    if (walkAction.current && idleAction.current) {
+      if (moving && !isWalking.current) {
+        walkAction.current.reset().play()
+        idleAction.current.crossFadeTo(walkAction.current, 0.2, true)
+        isWalking.current = true
+      } else if (!moving && isWalking.current) {
+        idleAction.current.reset().play()
+        walkAction.current.crossFadeTo(idleAction.current, 0.2, true)
+        isWalking.current = false
+      }
+    }
+
+    // B. Camera-relative movement so W always moves "up" the screen
+    const forward = new THREE.Vector3()
+    camera.getWorldDirection(forward)
+    forward.y = 0
+    forward.normalize()
+    const right = new THREE.Vector3().crossVectors(forward, UP).normalize()
+
+    const moveDir = new THREE.Vector3()
+    if (keys['KeyW'] || keys['ArrowUp'])    moveDir.add(forward)
+    if (keys['KeyS'] || keys['ArrowDown'])  moveDir.sub(forward)
+    if (keys['KeyD'] || keys['ArrowRight']) moveDir.add(right)
+    if (keys['KeyA'] || keys['ArrowLeft'])  moveDir.sub(right)
+
+    if (moveDir.lengthSq() > 0) {
+      moveDir.normalize()
+      targetVelocity.current.copy(moveDir).multiplyScalar(WALK_SPEED)
+      // Smoothly rotate to face the movement direction
+      const targetAngle = Math.atan2(moveDir.x, moveDir.z)
+      const targetQuat = new THREE.Quaternion().setFromAxisAngle(UP, targetAngle)
+      group.quaternion.slerp(targetQuat, Math.min(1, TURN_SPEED * delta))
+    } else {
+      targetVelocity.current.set(0, 0, 0)
+    }
+
+    // C. Momentum + final position (clamped to the farm grid)
+    velocity.current.lerp(targetVelocity.current, Math.min(1, ACCELERATION * delta))
+    group.position.addScaledVector(velocity.current, delta)
+    group.position.x = THREE.MathUtils.clamp(group.position.x, 0, 9.45)
+    group.position.z = THREE.MathUtils.clamp(group.position.z, 0, 9.45)
+    group.position.y = GROUND_Y
+
+    movePlayer([group.position.x, group.position.y, group.position.z])
   })
 
   return (
-    <mesh ref={meshRef} position={[5, 0.3, 5]} castShadow>
-      <capsuleGeometry args={[0.2, 0.3, 4, 8]} />
-      <meshStandardMaterial color="#4A90D9" />
-    </mesh>
+    <group ref={groupRef} position={[5, GROUND_Y, 5]}>
+      <primitive object={barbarian} />
+    </group>
   )
 }
 
@@ -271,7 +384,9 @@ export default function App() {
         <ambientLight intensity={0.4} />
         <directionalLight position={[10, 20, 10]} intensity={1.2} castShadow />
         <Farm />
-        <Player />
+        <Suspense fallback={null}>
+          <Player />
+        </Suspense>
         <GameLoop />
       </Canvas>
       <PlaceholderHUD />
