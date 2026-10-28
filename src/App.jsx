@@ -1,75 +1,12 @@
 // src/App.jsx
 import { Canvas, useFrame, useLoader, useThree } from '@react-three/fiber'
 import { OrthographicCamera, Text, Billboard, useFBX, useAnimations } from '@react-three/drei'
-import { useRef, useEffect, useMemo, Suspense } from 'react'
+import { useRef, useEffect, useMemo, useState, Suspense } from 'react'
 import * as THREE from 'three'
-import { create } from 'zustand'
-
-
-// ── Inline store (move to store/useGameStore.js later) ──
-const GRID_SIZE = 10
-const buildInitialTiles = () => {
-  const tiles = {}
-  for (let x = 0; x < GRID_SIZE; x++)
-    for (let z = 0; z < GRID_SIZE; z++)
-      tiles[`${x},${z}`] = { x, z, state: 'empty', cropType: null, growthTick: 0, watered: false }
-  return tiles
-}
-
-const useGameStore = create((set, get) => ({
-  tiles: buildInitialTiles(),
-  activeTool: 'hoe',
-  hoveredTile: null,
-  day: 1,
-  tickCount: 0,
-  player: { position: [5, 0, 5], coins: 50 },
-  inventory: { carrot_seed: 5, carrot: 0 },
-  selectedSeed: 'carrot_seed',
-
-  setHoveredTile: (key) => set({ hoveredTile: key }),
-  setActiveTool: (tool) => set({ activeTool: tool }),
-
-  useTileAction: (x, z) => {
-    const { activeTool, tiles, inventory, selectedSeed } = get()
-    const key = `${x},${z}`
-    const tile = tiles[key]
-    if (!tile) return
-    const updated = { ...tile }
-
-    if (activeTool === 'hoe' && tile.state === 'empty') {
-      updated.state = 'tilled'
-    } else if (activeTool === 'seed' && tile.state === 'tilled') {
-      if ((inventory[selectedSeed] ?? 0) <= 0) return
-      updated.state = 'seeded'
-      updated.cropType = 'carrot'
-      set((s) => ({ tiles: { ...s.tiles, [key]: updated }, inventory: { ...s.inventory, [selectedSeed]: s.inventory[selectedSeed] - 1 } }))
-      return
-    } else if (activeTool === 'wateringCan' && (tile.state === 'seeded' || tile.state === 'growing')) {
-      updated.watered = true
-    } else if (activeTool === 'scythe' && tile.state === 'harvestable') {
-      updated.state = 'empty'; updated.cropType = null; updated.growthTick = 0; updated.watered = false
-      set((s) => ({ tiles: { ...s.tiles, [key]: updated }, inventory: { ...s.inventory, carrot: (s.inventory.carrot ?? 0) + 1 } }))
-      return
-    }
-    set((s) => ({ tiles: { ...s.tiles, [key]: updated } }))
-  },
-
-  advanceTick: () => set((state) => {
-    const updatedTiles = { ...state.tiles }
-    for (const key in updatedTiles) {
-      const tile = { ...updatedTiles[key] }
-      if ((tile.state === 'seeded' || tile.state === 'growing') && tile.watered) {
-        tile.growthTick += 1
-        if (tile.growthTick >= 10) tile.state = 'harvestable'
-        else if (tile.growthTick >= 5) tile.state = 'growing'
-        updatedTiles[key] = tile
-      }
-    }
-    return { tiles: updatedTiles, tickCount: state.tickCount + 1 }
-  }),
-
-  movePlayer: (position) => set((s) => ({ player: { ...s.player, position } })),
-}))
+//import { create } from 'zustand'
+import { useGameStore } from './game/store/useGameStore'
+import { CROPS } from './game/config/crops'
+import { TILE_SPACING, MAP_CENTER, PLAYER_MAX, GROUND_SIZE, GROUND_CENTER } from './game/config/world'
 
 function CropTooltip({ state, cropType }) {
   const labels = {
@@ -114,30 +51,37 @@ function CropTooltip({ state, cropType }) {
 }
 
 // ── Tile ──
-const TILE_COLORS = { empty: '#8B7355', tilled: '#5C4033', seeded: '#5C4033', growing: '#4A7C3F', harvestable: '#F5C518' }
+const TILE_COLORS = { 
+  empty: '#8B7355', 
+  tilled: '#5C4033', 
+  seeded: '#5C4033', 
+  growing: '#4A7C3F', 
+  harvestable: '#F5C518', 
+  locked: '#4B4B45' 
+}
 
 function Tile({ tileData }) {
   const useTileAction = useGameStore((s) => s.useTileAction)
   const setHoveredTile = useGameStore((s) => s.setHoveredTile)
   const hoveredTile = useGameStore((s) => s.hoveredTile)
-  const { x, z, state, cropType } = tileData
+  const { x, z, state, cropType, stage, locked } = tileData
   const key = `${x},${z}`
   const isHovered = hoveredTile === key
 
   return (
     <mesh
-      position={[x * 1.05, 0, z * 1.05]}
+      position={[x*TILE_SPACING, 0, z*TILE_SPACING]}
       receiveShadow
       onClick={() => useTileAction(x, z)}
       onPointerEnter={() => setHoveredTile(key)}
       onPointerLeave={() => setHoveredTile(null)}
     >
       <boxGeometry args={[1, 0.15, 1]} />
-      <meshStandardMaterial color={TILE_COLORS[state]} emissive={isHovered ? '#fff' : '#000'} emissiveIntensity={isHovered ? 0.1 : 0} />
+      <meshStandardMaterial color={locked ? TILE_COLORS.locked : TILE_COLORS[state]} emissive={isHovered ? '#fff' : '#000'} emissiveIntensity={isHovered ? 0.1 : 0} />
 
       {/* Crop visuals */}
       {state === 'growing' && (
-        <mesh position={[0, 0.2, 0]}>
+        <mesh position={[0, 0.2, 0]} scale={[1, 0.6 + stage * 0.4, 1]}>
           <cylinderGeometry args={[0.05, 0.1, 0.25, 6]} />
           <meshStandardMaterial color="#2D5A1B" />
         </mesh>
@@ -145,7 +89,7 @@ function Tile({ tileData }) {
       {state === 'harvestable' && (
         <mesh position={[0, 0.3, 0]}>
           <sphereGeometry args={[0.18, 8, 8]} />
-          <meshStandardMaterial color={cropType === 'carrot' ? '#FF6B1A' : '#88CC44'} />
+          <meshStandardMaterial color={CROPS[cropType]?.color ?? '#88CC44'} />
         </mesh>
       )}
 
@@ -162,8 +106,8 @@ function Farm() {
   const tiles = useGameStore((s) => s.tiles)
   return (
     <group>
-      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[4.7, -0.08, 4.7]} receiveShadow>
-        <planeGeometry args={[16, 16]} />
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[GROUND_CENTER, -0.08, GROUND_CENTER]} receiveShadow>
+        <planeGeometry args={[GROUND_SIZE, GROUND_SIZE]} />
         <meshStandardMaterial color="#6B8E4E" />
       </mesh>
       {Object.values(tiles).map((tile) => (
@@ -307,15 +251,15 @@ function Player() {
     // C. Momentum + final position (clamped to the farm grid)
     velocity.current.lerp(targetVelocity.current, Math.min(1, ACCELERATION * delta))
     group.position.addScaledVector(velocity.current, delta)
-    group.position.x = THREE.MathUtils.clamp(group.position.x, 0, 9.45)
-    group.position.z = THREE.MathUtils.clamp(group.position.z, 0, 9.45)
+    group.position.x = THREE.MathUtils.clamp(group.position.x, 0, PLAYER_MAX)
+    group.position.z = THREE.MathUtils.clamp(group.position.z, 0, PLAYER_MAX)
     group.position.y = GROUND_Y
 
     movePlayer([group.position.x, group.position.y, group.position.z])
   })
 
   return (
-    <group ref={groupRef} position={[5, GROUND_Y, 5]}>
+    <group ref={groupRef} position={[MAP_CENTER, GROUND_Y, MAP_CENTER]}>
       <primitive object={barbarian} />
     </group>
   )
@@ -332,19 +276,101 @@ function GameLoop() {
   return null
 }
 
+// ── Seed picker ──
+const SEEDS = [
+  { key: 'carrot_seed', label: '🥕 Carrot' },
+  { key: 'potato_seed', label: '🥔 Potato' },
+  { key: 'wheat_seed',  label: '🌾 Wheat' },
+  { key: 'tomato_seed', label: '🍅 Tomato' },
+]
+
+function SeedPicker() {
+  const inventory = useGameStore((s) => s.inventory)
+  const selectedSeed = useGameStore((s) => s.selectedSeed)
+  const setSelectedSeed = useGameStore((s) => s.setSelectedSeed)
+  const activeTool = useGameStore((s) => s.activeTool)
+
+  if (activeTool !== 'seed') return null
+
+  return (
+    <div style={{ position: 'absolute', bottom: 80, left: '50%', transform: 'translateX(-50%)', display: 'flex', gap: 8, pointerEvents: 'all' }}>
+      {SEEDS.map(({ key, label }) => {
+        const count = inventory[key] ?? 0
+        const selected = selectedSeed === key
+        return (
+          <button key={key} onClick={() => setSelectedSeed(key)} style={{
+            padding: '8px 12px', borderRadius: 8, border: 'none', cursor: 'pointer',
+            background: selected ? '#F5C518' : 'rgba(0,0,0,0.6)',
+            color: selected ? '#000' : '#fff',
+            opacity: count > 0 ? 1 : 0.4,
+            fontFamily: 'monospace', fontWeight: 'bold',
+          }}>
+            {label} ×{count}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+// ── Almanac ──
+function Almanac({ onClose }) {
+  const discovered = useGameStore((s) => s.discovered)
+
+  return (
+    <div
+      onWheel={(e) => e.stopPropagation()}
+      style={{
+        position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+        width: 420, maxHeight: '70vh', overflowY: 'auto', pointerEvents: 'all',
+        background: 'rgba(26,26,46,0.95)', border: '2px solid #F5C518',
+        borderRadius: 12, padding: 16, color: 'white',
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+        <strong style={{ fontSize: 18 }}>📖 Plant Almanac</strong>
+        <button onClick={onClose} style={{
+          border: 'none', borderRadius: 6, padding: '4px 10px', cursor: 'pointer',
+          background: '#F5C518', color: '#000', fontFamily: 'monospace', fontWeight: 'bold',
+        }}>✕</button>
+      </div>
+      {Object.entries(CROPS).map(([id, c]) => {
+        const found = discovered[id]
+        return (
+          <div key={id} style={{ display: 'flex', gap: 12, padding: '10px 0', borderTop: '1px solid rgba(255,255,255,0.15)', opacity: found ? 1 : 0.5 }}>
+            <div style={{ fontSize: 32 }}>{found ? c.emoji : '❓'}</div>
+            <div>
+              <div style={{ fontWeight: 'bold' }}>
+                {found ? c.label : '???'}
+                {found && <span style={{ fontWeight: 'normal', opacity: 0.7 }}> · discovered Day {found.day}</span>}
+              </div>
+              <div style={{ fontSize: 13, opacity: 0.85 }}>
+                {found ? c.trivia : 'Harvest this crop to discover it.'}
+              </div>
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 // ── Placeholder HUD (Dev B) ──
 function PlaceholderHUD() {
   const day = useGameStore((s) => s.day)
   const coins = useGameStore((s) => s.player.coins)
   const inventory = useGameStore((s) => s.inventory)
+  const discovered = useGameStore((s) => s.discovered)
   const activeTool = useGameStore((s) => s.activeTool)
   const setActiveTool = useGameStore((s) => s.setActiveTool)
+  const [almanacOpen, setAlmanacOpen] = useState(false)
 
   return (
     <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', fontFamily: 'monospace' }}>
       {/* Top bar */}
       <div style={{ position: 'absolute', top: 16, left: 16, color: 'white', background: 'rgba(0,0,0,0.5)', padding: '8px 12px', borderRadius: 8 }}>
-        📅 Day {day} &nbsp;|&nbsp; 🟡 {coins} &nbsp;|&nbsp; 🌱 Seeds: {inventory['carrot_seed'] ?? 0} &nbsp;|&nbsp; 🥕 Harvested: {inventory['carrot'] ?? 0}
+           📅 Day {day} &nbsp;|&nbsp; 🟡 {coins} &nbsp;|&nbsp; 🧺 Harvested:{' '}
+          {Object.entries(CROPS).map(([id, c]) => `${c.emoji} ${inventory[id] ?? 0}`).join('  ')}
       </div>
       {/* Tool switcher */}
       <div style={{ position: 'absolute', bottom: 24, left: '50%', transform: 'translateX(-50%)', display: 'flex', gap: 8, pointerEvents: 'all' }}>
@@ -358,15 +384,31 @@ function PlaceholderHUD() {
           </button>
         ))}
       </div>
+      <SeedPicker />
+
+            {/* Almanac button */}
+      <button onClick={() => setAlmanacOpen((o) => !o)} style={{
+        position: 'absolute', bottom: 24, left: 16, pointerEvents: 'all',
+        padding: '10px 16px', borderRadius: 8, border: 'none', cursor: 'pointer',
+        background: 'rgba(0,0,0,0.6)', color: '#fff', fontFamily: 'monospace', fontWeight: 'bold',
+      }}>
+        📖 Almanac {Object.keys(discovered).length}/{Object.keys(CROPS).length}
+      </button>
+      {almanacOpen && <Almanac onClose={() => setAlmanacOpen(false)} />}
     </div>
   )
 }
 
 // ── App ──
 export default function App() {
+  const zoom = useGameStore((s) => s.zoom)
+  const zoomBy = useGameStore((s) => s.zoomBy)
+
   return (
-    <div style={{ width: '100vw', height: '100vh', position: 'relative', background: '#1a1a2e' }}>
-      // Replace your Canvas block with this
+    <div
+      onWheel={(e) => zoomBy(e.deltaY > 0 ? 0.9 : 1.1)}
+      style={{ width: '100vw', height: '100vh', position: 'relative', background: '#1a1a2e' }}
+    >
       <Canvas
         shadows
         style={{ width: '100%', height: '100%' }}
@@ -374,11 +416,14 @@ export default function App() {
       >
         <OrthographicCamera
           makeDefault
-          position={[10, 5, 10]}
-          zoom={70}
+          position={[MAP_CENTER + 5, 5, MAP_CENTER + 5]}
+          zoom={zoom}
           near={-100}
           far={500}
-          onUpdate={(cam) => cam.lookAt(5, 0, 5)}
+          onUpdate={(cam) => {
+            cam.lookAt(MAP_CENTER, 0, MAP_CENTER)
+            cam.updateProjectionMatrix()
+          }}
         />
         <ambientLight intensity={0.4} />
         <directionalLight position={[10, 20, 10]} intensity={1.2} castShadow />
@@ -389,6 +434,18 @@ export default function App() {
         <GameLoop />
       </Canvas>
       <PlaceholderHUD />
+      {/* Zoom buttons */}
+      <div style={{ position: 'absolute', top: 16, right: 16, display: 'flex', gap: 8 }}>
+        {[['−', 0.85], ['+', 1.15]].map(([label, factor]) => (
+          <button key={label} onClick={() => zoomBy(factor)} style={{
+            width: 40, height: 40, borderRadius: 8, border: 'none', cursor: 'pointer',
+            background: 'rgba(0,0,0,0.6)', color: '#fff',
+            fontFamily: 'monospace', fontWeight: 'bold', fontSize: 20,
+          }}>
+            {label}
+          </button>
+        ))}
+      </div>
     </div>
   )
 }

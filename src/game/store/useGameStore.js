@@ -1,22 +1,26 @@
 // src/game/store/useGameStore.js
 import { create } from 'zustand'
-
-const GRID_SIZE = 10
+import { CROPS, GROWTH_SPEED } from '../config/crops'
+import { STARTER_AREA, PLOTS, MAP_CENTER, ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT } from '../config/world'
 
 // Generate flat tile map: key = "x,z"
-const buildInitialTiles = () => {
+function buildArea(area, locked) {
   const tiles = {}
-  for (let x = 0; x < GRID_SIZE; x++) {
-    for (let z = 0; z < GRID_SIZE; z++) {
+  for (let x = area.x; x < area.x + area.w; x++) {
+    for (let z = area.z; z < area.z + area.h; z++) {
       tiles[`${x},${z}`] = {
-        x, z,
-        state: 'empty',      // empty | tilled | seeded | growing | harvestable
-        cropType: null,       // 'carrot' | 'potato' | 'wheat' | 'tomato'
-        growthTick: 0,        // increments each game tick
-        watered: false,
+        x, z, state: 'empty', cropType: null,
+        growthTick: 0, stage: 0, watered: false,
+        plotId: area.id, locked,
       }
     }
   }
+  return tiles
+}
+
+function buildInitialTiles() {
+  const tiles = buildArea(STARTER_AREA, false)
+  PLOTS.forEach((p) => Object.assign(tiles, buildArea(p, true)))
   return tiles
 }
 
@@ -28,7 +32,7 @@ export const useGameStore = create((set, get) => ({
 
   // ── Player ─────────────────────────────────────────
   player: {
-    position: [5, 0, 5], // world position
+    position: [MAP_CENTER, 0, MAP_CENTER], // world position
     coins: 50,
   },
 
@@ -53,18 +57,26 @@ export const useGameStore = create((set, get) => ({
 
   // ── Selected tile (for UI highlight) ───────────────
   hoveredTile: null,     // "x,z" string or null
+  zoom: ZOOM_DEFAULT,
+  discovered: {},        // { carrot: { day: 3 }, ... } filled on first harvest
 
   // ══ Actions (Dev B read state, calls these) ════════
 
   setActiveTool: (tool) => set({ activeTool: tool }),
   setSelectedSeed: (seed) => set({ selectedSeed: seed }),
   setHoveredTile: (key) => set({ hoveredTile: key }),
+  zoomBy: (factor) =>
+    set((state) => ({
+      zoom: Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, state.zoom * factor)),
+    })),
 
   useTileAction: (x, z) => {
     const { activeTool, selectedSeed, tiles, inventory } = get()
     const key = `${x},${z}`
     const tile = tiles[key]
+
     if (!tile) return
+    if (tile.locked) return
 
     set((state) => {
       const updatedTile = { ...tile }
@@ -88,10 +100,14 @@ export const useGameStore = create((set, get) => ({
         updatedTile.state = 'empty'
         updatedTile.cropType = null
         updatedTile.growthTick = 0
+        updatedTile.stage = 0
         updatedTile.watered = false
         return {
           tiles: { ...state.tiles, [key]: updatedTile },
           inventory: { ...state.inventory, [crop]: (state.inventory[crop] ?? 0) + 1 },
+          discovered: state.discovered[crop]
+            ? state.discovered
+            : { ...state.discovered, [crop]: { day: state.day } },
         }
       }
 
@@ -113,28 +129,27 @@ export const useGameStore = create((set, get) => ({
 
       const timeOfDay = (newTick % TICKS_PER_DAY) / TICKS_PER_DAY
 
-      // Grow watered crops
-      const GROWTH_THRESHOLDS = {
-        carrot: 60, potato: 90, wheat: 45, tomato: 120,
-      }
-
       for (const key in updatedTiles) {
         const tile = { ...updatedTiles[key] }
         const isGrowingCrop = tile.state === 'seeded' || tile.state === 'growing'
+        if (!isGrowingCrop) continue
 
         // Crops dry out at the start of each day and must be re-watered
-        if (isNewDay && isGrowingCrop && tile.watered) {
+        if (isNewDay && tile.watered) {
           tile.watered = false
           updatedTiles[key] = tile
+          continue
         }
 
-        if (isGrowingCrop && tile.watered) {
-          tile.growthTick += 1
-          const threshold = GROWTH_THRESHOLDS[tile.cropType] ?? 60
-          if (tile.growthTick >= threshold) {
+        if (tile.watered) {
+          const crop = CROPS[tile.cropType]
+          tile.growthTick += GROWTH_SPEED
+          if (tile.growthTick >= crop.growthTicks) {
             tile.state = 'harvestable'
-          } else if (tile.growthTick > threshold / 2) {
-            tile.state = 'growing'
+            tile.stage = crop.stages - 1
+          } else {
+            tile.stage = Math.floor((tile.growthTick / crop.growthTicks) * (crop.stages - 1))
+            tile.state = tile.stage >= 1 ? 'growing' : 'seeded'
           }
           updatedTiles[key] = tile
         }
